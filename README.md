@@ -20,9 +20,18 @@ tunnel as its own systemd service.
   the matching build. It falls back to the next build if one crashes with an
   illegal instruction. You can also install a specific tag, choose the build by
   hand, or install offline from a local zip.
-- **Quick wizard (15 modes)**: port forward, Direct/Reverse TCP, TLS, Reality,
+- **Quick wizard (16 modes)**: port forward, Direct/Reverse TCP, TLS, Reality,
   QUIC and KCP, the ICMP (Ping) tunnel, the Fake TCP header tunnel, a WireGuard VPN
-  server and a user database with a management API.
+  server, a WireGuard relay and a user database with a management API.
+- **Pairing codes**: after you create one side of a tunnel, the script prints a
+  code. Running `ww join <code>` on the other server creates the matching side
+  with the same secrets, SNI, ports, Mux and encryption settings, so the two
+  sides cannot get out of sync. Works for every two-sided wizard mode and
+  official template.
+- **WireGuard relay**: users keep the official WireGuard apps; the relay carries
+  their WireGuard traffic to the final server inside Reality, TLS or encrypted
+  TCP. WireGuard (keys, peers, limits) stays on the final server, where it must
+  already be installed; nothing about users is stored on the relay.
 - **Official templates (86 configs in 25 families)**: generated from the
   [WaterWall docs](https://radkesvat.github.io/WaterWall-Docs/) examples. They
   include BitSwap + Mux, ProtoSwap, BGP4, RTMP/RTMPS, HalfDuplex, ConnectionStripe,
@@ -83,6 +92,10 @@ These screenshots were taken from the real script output in dry-run mode
 
 ![CLI help](screenshots/07-cli-help.png)
 
+**Joining with a pairing code on the other server**
+
+![Pairing code join](screenshots/08-pairing-join.png)
+
 </details>
 
 ## Requirements
@@ -136,8 +149,51 @@ If GitHub is blocked on the server:
 | **Single** | Modes that run on one machine only (port forward, WireGuard server, management API). |
 
 Create the same mode on both servers, one with each role, and use the same
-shared values (password, SNI, UUID, Mux and encryption settings). After a
-tunnel is created, the script prints exactly which values the other server needs.
+shared values (password, SNI, UUID, Mux and encryption settings). The easiest
+way is a pairing code (below).
+
+## Pairing codes
+
+1. Create the tunnel on either server (client or server side).
+2. The script prints a pairing code (`WW1-...`) and the command to run on the
+   other server. You can show it again later with `ww pair-code <name>` or from
+   the tunnel's menu.
+3. On the other server run:
+
+   ```bash
+   ww join WW1-...
+   # or, if the manager is not installed there yet:
+   curl -fsSL -o ww.sh https://raw.githubusercontent.com/javadkhammari/waterwall-manager./main/waterwall-manager.sh
+   sudo bash ww.sh join WW1-...
+   ```
+
+   It creates the matching side and only asks for things that are local to
+   that server (for example the final service port or the user-facing port).
+
+The code contains the tunnel's secrets, so share it privately. It is plain
+data: nothing in it is executed, and every value is validated like normal
+input. Before creating the code, the script asks for this server's public
+address, because the other side uses it to connect or to whitelist this one.
+
+## WireGuard relay
+
+```
+WireGuard app ──UDP──▶ relay (client) ══ Reality / TLS / encrypted TCP ══▶ final server (server) ──▶ WireGuard on 127.0.0.1
+```
+
+- **Final server**: WireGuard must already be installed and running. The
+  script does not install or change it; it only asks for its port (it detects
+  it if `wg` is installed). You can optionally block direct access to that
+  port from outside, so only the relay tunnel reaches it. Say yes only if all
+  users connect through relays.
+- **Relay**: no WireGuard keys or peers are stored here. In users' configs
+  set `Endpoint = <relay IP or domain>:<relay port>`. If a relay gets blocked,
+  bring up a new one and point the same domain at it; user configs stay the same.
+- **What the network sees**: between the relay and the final server only a
+  TLS/Reality connection is visible. Between the user and the relay it is
+  plain WireGuard, because the official apps cannot wrap it.
+- **Performance**: TLS and Reality are TCP carriers, so under heavy packet loss
+  between the two servers speed drops (TCP over TCP).
 
 ## Usage
 
@@ -160,6 +216,8 @@ Command line:
 | `ww status\|logs\|health\|info <name>` | Inspect a tunnel |
 | `ww limit <name>` | Set or remove a bandwidth limit |
 | `ww wg-add <name> [client]` | Add a WireGuard client and print its config |
+| `ww pair-code <name>` | Show the pairing code for the other server |
+| `ww join <code>` | Create the other side of a tunnel from a pairing code |
 | `ww restart-all` / `ww stop-all` | Control all tunnels |
 | `ww delete <name>` | Delete a tunnel |
 | `ww templates` | List all official templates |
@@ -217,8 +275,16 @@ WW_ROOT=/tmp/wwtest WW_OFFLINE=1 bash waterwall-manager.sh
 ```
 
 In this mode, all files are written under `$WW_ROOT` and systemd calls are
-skipped. In this mode, every wizard mode (both roles) and all 86 official
-templates were generated through the menu and passed the config self-check.
+skipped. In this mode:
+
+- every wizard mode (both roles) and all 86 official templates were generated
+  through the menu and passed the config self-check;
+- pairing was tested end to end for every two-sided wizard mode (both
+  directions, all three relay carriers) and every two-sided official template:
+  one side was created, its code was joined on the "other server", and the two
+  configs were checked to match (secrets, SNI vs certificate, ports, Mux,
+  encryption, whitelists, addresses).
+
 Running WaterWall itself with these configs on real servers is the next step.
 
 ## Credits

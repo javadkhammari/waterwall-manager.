@@ -14,8 +14,10 @@ set -o pipefail
 # ----------------------------------------------------------------------------
 # [MODULE] constants
 # ----------------------------------------------------------------------------
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly REPO="radkesvat/WaterWall"
+# Where 'ww join' tells the other server to download this manager from (change if you fork/rename the repo)
+MANAGER_RAW_URL="${MANAGER_RAW_URL:-https://raw.githubusercontent.com/javadkhammari/waterwall-manager./main/waterwall-manager.sh}"
 WW_ROOT="${WW_ROOT:-}"                          # set for dry-run/testing (e.g. /tmp/wwtest)
 WW_HOME="${WW_ROOT}/opt/waterwall"
 WW_BIN_DIR="${WW_HOME}/bin"
@@ -66,9 +68,27 @@ EOF
   line
 }
 
+# Answers taken from a pairing code (see the pairing module). Keys are the VAR names used in ask/choose,
+# confirm keys, or "tpl:<template variable>".
+declare -A PREFILL=()
+
+# prefill_take KEY [validator] -> succeeds if KEY has a prefilled value that passes the validator
+prefill_take() {
+  [[ -n ${PREFILL[$1]+x} ]] || return 1
+  [[ -z ${2:-} ]] && return 0
+  ( "$2" "${PREFILL[$1]}" ) </dev/null >/dev/null 2>&1    # subshell: a validator that prompts cannot block or exit us
+}
+prefill_show() { # label value
+  local v=$2; [[ $1 =~ [Pp]assword|[Ss]ecret|token ]] && v="(hidden)"
+  printf '%s[✓]%s %s: %s %s(pairing code)%s\n' "$C_G" "$C_0" "$1" "$v" "$C_D" "$C_0"
+}
+
 # ask VAR "Prompt" "default" [validator]
 ask() {
   local __var=$1 __prompt=$2 __def=${3:-} __val=${4:-} __in
+  if prefill_take "$__var" "$__val"; then
+    printf -v "$__var" '%s' "${PREFILL[$__var]}"; prefill_show "$__prompt" "${PREFILL[$__var]}"; return 0
+  fi
   while true; do
     if [[ -n "$__def" ]]; then
       read -rp "$(printf '%s?%s %s %s[%s]%s: ' "$C_Y" "$C_0" "$__prompt" "$C_D" "$__def" "$C_0")" __in || die "Input closed."
@@ -82,9 +102,12 @@ ask() {
   done
 }
 
-# confirm "Question" [y|n default]
+# confirm "Question" [y|n default] [prefill key]
 confirm() {
   local q=$1 d=${2:-n} a hint="[y/N]"
+  if [[ -n ${3:-} && ${PREFILL[$3]:-} =~ ^[yn]$ ]]; then
+    prefill_show "$q" "$([[ ${PREFILL[$3]} == y ]] && echo yes || echo no)"; [[ ${PREFILL[$3]} == y ]]; return
+  fi
   [[ $d == y ]] && hint="[Y/n]"
   read -rp "$(printf '%s?%s %s %s: ' "$C_Y" "$C_0" "$q" "$hint")" a || die "Input closed."
   a=${a:-$d}
@@ -95,6 +118,10 @@ confirm() {
 choose() {
   local __var=$1 __title=$2; shift 2
   local i=1 __c o
+  if [[ ${PREFILL[$__var]:-} =~ ^[0-9]+$ ]] && (( PREFILL[$__var] >= 1 && PREFILL[$__var] <= $# )); then
+    local __pick=${PREFILL[$__var]}
+    prefill_show "${__title%:}" "${!__pick}"; printf -v "$__var" '%s' "$__pick"; return 0
+  fi
   [[ -n $__title ]] && printf '%s%s%s\n' "$C_W" "$__title" "$C_0"
   for o in "$@"; do printf '  %s%2d)%s %s\n' "$C_C" "$i" "$C_0" "$o"; ((i++)); done
   while true; do
@@ -472,15 +499,20 @@ config_ok() { [[ -z $(config_check "$1") ]]; }
 # ----------------------------------------------------------------------------
 # cert_setup DOMAIN  -> sets CERT_FILE KEY_FILE VERIFY
 cert_setup() {
-  local sni=$1 c
-  choose c "TLS certificate for $sni (server side):" \
+  local sni=$1 CERT_MODE
+  choose CERT_MODE "TLS certificate for $sni (server side):" \
     "Generate self-signed (quick; clients must use verify=false)" \
     "Use existing cert files (e.g. Let's Encrypt; clients verify=true)" \
     "Issue with certbot standalone (needs port 80 + domain pointing here)"
   mkdir -p "$WW_CERTS"
-  case $c in
+  CERT_SELF_SIGNED=n
+  case $CERT_MODE in
     1)
+      CERT_SELF_SIGNED=y
       CERT_FILE="$WW_CERTS/$sni.crt"; KEY_FILE="$WW_CERTS/$sni.key"; VERIFY=false
+      if [[ -s $CERT_FILE && -s $KEY_FILE ]] && openssl x509 -in "$CERT_FILE" -noout -checkend 86400 >/dev/null 2>&1; then
+        ok "Reusing the existing self-signed certificate for $sni (shared with other tunnels)."; return 0
+      fi
       openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
         -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$sni" -addext "subjectAltName=DNS:$sni" >/dev/null 2>&1 \
         || openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$sni" >/dev/null 2>&1 \
@@ -519,6 +551,7 @@ MODES=(
   "ping|ICMP (Ping) tunnel — raw socket"
   "faketcp|Fake TCP header tunnel — raw socket"
   "wireguard|WireGuard VPN server (for official WireGuard apps)"
+  "wg-relay|WireGuard relay: apps -> relay (client) -> final server's existing WireGuard (server)"
   "authapi|User database + management API (AuthenticationServer + APIServer)"
 )
 
@@ -563,7 +596,7 @@ collect_transport_params() { # kind side(client|server)
     tls|quic)
       if [[ $side == client ]]; then
         ask SNI "SNI / domain for the TLS handshake" "${SNI:-www.example.com}" is_domain
-        if confirm "Is the server certificate self-signed?" y; then VERIFY=false; else VERIFY=true; fi
+        if confirm "Is the server certificate self-signed?" y SELF_SIGNED; then VERIFY=false; else VERIFY=true; fi
       else
         ask SNI "Certificate domain (CN/SAN)" "${SNI:-www.example.com}" is_domain
         cert_setup "$SNI" || return 1
@@ -574,19 +607,18 @@ collect_transport_params() { # kind side(client|server)
         ask SNI "Reality SNI (cover site)" "${SNI:-}" is_reality_site
       else
         info "Cover site: a normal, real HTTPS site (not Google or other big IP-whitelisted sites); use the same as the client's SNI."
-        local vh; ask vh "Real site for non-authenticated visitors (domain or IP)" "" is_reality_host
-        VISITOR_IP=$vh
+        local vh; ask VISITOR_HOST "Real site for non-authenticated visitors (domain or IP)" "" is_reality_host
+        vh=$VISITOR_HOST; VISITOR_IP=$vh
         if ! is_ip "$vh"; then
           VISITOR_IP=$(resolve4 "$vh")
           [[ -n $VISITOR_IP ]] || ask VISITOR_IP "Could not resolve $vh; enter its IPv4" "" is_ipv4
         fi
-        VISITOR_HOST=$vh
       fi
       gp=$(rand_pass 24)
       ask PASSWORD "Shared Reality password (same on both sides)" "${PASSWORD:-$gp}" is_secret32;;
     tcp|kcp)
-      if [[ $kind == kcp ]] && confirm "Enable KCP FEC (forward error correction; same on both sides)?" n; then FEC=1; fi
-      if confirm "Add AEAD encryption layer (ChaCha20; same choice on both sides)?" y; then
+      if [[ $kind == kcp ]] && confirm "Enable KCP FEC (forward error correction; same on both sides)?" n FEC; then FEC=1; fi
+      if confirm "Add AEAD encryption layer (ChaCha20; same choice on both sides)?" y ENC; then
         ENC=1; gp=$(rand_pass 24)
         ask ENC_PASS "Encryption password (max 32 chars, same on both sides)" "$gp" is_secret32
       fi;;
@@ -595,7 +627,7 @@ collect_transport_params() { # kind side(client|server)
 
 ask_mux() {
   MUX=0; MUX_N=4
-  if confirm "Enable Mux (same choice on both sides)?" "${1:-y}"; then
+  if confirm "Enable Mux (same choice on both sides)?" "${1:-y}" MUX; then
     MUX=1; ask MUX_N "Mux connections per worker" "4" is_num
   fi
 }
@@ -751,7 +783,7 @@ gen_ping() {
 
 gen_faketcp() {
   warn "RawSocket captures ALL TCP from the peer IP — SSH between these two servers will break!"
-  confirm "Continue?" n || return 1
+  confirm "Continue?" n RAW_OK || return 1
   ask_both_ips
   ask FAKE_SRV_PORT "Fake TCP server port" "40000" is_port
   ask FAKE_CLI_FROM "Fake client port range start" "40001" is_port
@@ -779,6 +811,84 @@ gen_faketcp() {
            "$(node outbound TcpConnector "$(s_tcp_conn "$FINAL_IP" "$FINAL_PORT")")")
     META+=("FINAL=$FINAL_IP:$FINAL_PORT" "PEER=$IP_CLIENT")
   fi
+}
+
+# ----------------------------------------------------------------------------
+# [MODULE] WireGuard relay
+#   client = relay: users' official WireGuard apps connect here (plain WireGuard UDP);
+#            the datagrams are framed with UdpOverTcp and carried inside Reality/TLS/encrypted TCP.
+#   server = final server: unwraps them and hands them to the WireGuard that already runs there.
+#   WireGuard keys and peers live only on the final server; the relay never decrypts anything.
+# ----------------------------------------------------------------------------
+RELAY_CARRIERS=("Reality (recommended, no certificate needed)" "TLS" "TCP + ChaCha20 encryption")
+relay_kind() { case $1 in 1) echo reality;; 2) echo tls;; *) echo tcp;; esac; }
+
+# Carrier security parameters. "tcp" always means TCP + ChaCha20 here (plain TCP would expose WireGuard).
+relay_carrier_params() { # kind side
+  if [[ $1 == tcp ]]; then
+    ENC=1; local gp; gp=$(rand_pass 24)
+    ask ENC_PASS "Encryption password (max 32 chars, same on both sides)" "$gp" is_secret32
+  else
+    collect_transport_params "$1" "$2"
+  fi
+}
+
+detect_wg_port() { command -v wg >/dev/null && wg show all listen-port 2>/dev/null | awk 'NR==1{print $2}'; }
+
+gen_wgrelay() {
+  local kind
+  if [[ $ROLE == client ]]; then
+    info "This is the RELAY. Users' WireGuard configs must use: Endpoint = <this server's IP or domain>:<port below>."
+    ask USER_PORT "UDP port the WireGuard apps connect to (on this relay)" "51820" is_port
+    ask PEER_IP "Final server IP or domain" "" is_host
+    choose CARRIER "Carrier between the relay and the final server:" "${RELAY_CARRIERS[@]}"; kind=$(relay_kind "$CARRIER")
+    ask TRANSPORT_PORT "Carrier port on the final server" "443" is_port
+    relay_carrier_params "$kind" client || return 1
+    ask_mux y
+    build_transport_client "$kind" to_server
+    local after_uot=$THEAD; local -a mux=()
+    if ((MUX)); then mux=("$(node mux_client MuxClient "$(s_mux_client "$MUX_N")" "$THEAD")"); after_uot=mux_client; fi
+    NODES=("$(node wg_inbound UdpListener "$(s_udp_listen "$USER_PORT")" udp_over_tcp)"
+           "$(node udp_over_tcp UdpOverTcpClient '{}' "$after_uot")" "${mux[@]}" "${TNODES[@]}"
+           "$(node to_server TcpConnector "$(s_tcp_conn "$PEER_IP" "$TRANSPORT_PORT")")")
+    META+=("USER_PORT=$USER_PORT" "PEER=$PEER_IP:$TRANSPORT_PORT" "CARRIER=$kind")
+  else
+    info "This is the FINAL server. WireGuard must already be installed and running here."
+    ask TRANSPORT_PORT "Carrier listen port (on this server)" "443" is_port
+    local wgp; wgp=$(detect_wg_port)
+    ask WG_PORT "Port of the existing WireGuard on this server" "${wgp:-51820}" is_port
+    ask PEER_IP "Relay server IP to whitelist (0 = allow any)" "0" is_ip_or_zero
+    choose CARRIER "Carrier between the relay and the final server:" "${RELAY_CARRIERS[@]}"; kind=$(relay_kind "$CARRIER")
+    relay_carrier_params "$kind" server || return 1
+    ask_mux y
+    local wl=""; is_ip "$PEER_IP" && wl=$(ip_cidr "$PEER_IP")
+    local after=udp_over_tcp; ((MUX)) && after=mux_server
+    build_transport_server "$kind" "$after"
+    NODES=("$(node transport_inbound TcpListener "$(s_tcp_listen "$TRANSPORT_PORT" "$wl")" "$THEAD")" "${TNODES[@]}")
+    ((MUX)) && NODES+=("$(node mux_server MuxServer '{}' udp_over_tcp)")
+    NODES+=("$(node udp_over_tcp UdpOverTcpServer '{}' to_wireguard)"
+            "$(node to_wireguard UdpConnector "$(s_udp_conn 127.0.0.1 "$WG_PORT")")")
+    META+=("TRANSPORT_PORT=$TRANSPORT_PORT" "FINAL_UDP=127.0.0.1:$WG_PORT" "CARRIER=$kind" "WG_PORT=$WG_PORT")
+    if confirm "Block direct access to WireGuard port $WG_PORT from outside (only the relay tunnel can reach it)? Say yes only if ALL users connect through relays" n BLOCK_WG; then
+      RELAY_BLOCK_WG=1; META+=("BLOCK_DIRECT_WG=yes")
+    fi
+  fi
+}
+
+relay_write_hooks() { # tunnel port
+  local d="$WW_TUNNELS/$1" p=$2
+  cat >"$d/post-up.sh" <<EOF
+#!/bin/sh
+# Only the relay tunnel (via loopback) may reach WireGuard on UDP ${p} (written by waterwall-manager)
+iptables -C INPUT -p udp --dport ${p} ! -i lo -j DROP 2>/dev/null || iptables -I INPUT -p udp --dport ${p} ! -i lo -j DROP
+exit 0
+EOF
+  cat >"$d/post-down.sh" <<EOF
+#!/bin/sh
+iptables -D INPUT -p udp --dport ${p} ! -i lo -j DROP 2>/dev/null
+exit 0
+EOF
+  chmod 700 "$d/post-up.sh" "$d/post-down.sh"
 }
 
 # ----------------------------------------------------------------------------
@@ -1635,16 +1745,22 @@ tpl_prompt_vars() {
           [[ -n ${TVRAW[$k]:-} ]] && { dom=${TVRAW[$k]}; break; }; done
         [[ -z $dom ]] && ask dom "Certificate domain" "www.example.com" is_domain
         cert_setup "$dom" || return 1
+        TPL_CERTDOM=$dom; TPL_SELF_SIGNED=$CERT_SELF_SIGNED
         TVJ[certificate_path]=$(json_str "$CERT_FILE"); TVJ[key_path]=$(json_str "$KEY_FILE"); cert_done=1; continue;;
       key_path) ((cert_done)) && continue;;
       visitor_ip|ip_behind_domain_white)
-        info "Cover site: a normal, real HTTPS site (not Google or other big IP-whitelisted sites)."
-        local vh; ask vh "$label (domain or IP)" "" is_reality_host
+        local vh
+        if prefill_take "tpl:$var" is_reality_host; then vh=${PREFILL[tpl:$var]}; prefill_show "$label" "$vh"
+        else
+          info "Cover site: a normal, real HTTPS site (not Google or other big IP-whitelisted sites)."
+          ask vh "$label (domain or IP)" "" is_reality_host
+        fi
         if ! is_ip "$vh"; then v=$(resolve4 "$vh"); [[ -n $v ]] || ask v "Could not resolve $vh; enter its IPv4" "" is_ipv4; else v=$vh; fi
-        TVJ[$var]=$(json_str "$v"); TVRAW[$var]=$v; continue;;
+        TVJ[$var]=$(json_str "$v"); TVRAW[$var]=$vh; continue;;
     esac
     local vfn; vfn=$(tpl_validator "$type" "$var"); (( reality_dom )) && vfn=is_reality_site
-    ask v "$label" "$prompt_def" "$vfn"
+    if prefill_take "tpl:$var" "$vfn"; then v=${PREFILL[tpl:$var]}; [[ $type == cidr32 ]] && v=${v%/32}; prefill_show "$label" "$v"
+    else ask v "$label" "$prompt_def" "$vfn"; fi
     TVRAW[$var]=$v
     case $type in
       port|int) TVJ[$var]=$((10#$v));;
@@ -1658,7 +1774,13 @@ tpl_prompt_vars() {
     fi
     case $type in secret|uuid|domain) SHARE+=("$var=$v");; esac
     case $var in obfuscator_key|protoswap_tcp_to_number|fake_server_port|fake_client_ports|stripe_connections|*mux*|shared.ws-path) SHARE+=("$var=$v");; esac
-  done 3< <(tpl_vars "$tid")
+  done 3< <(tpl_vars_ordered "$tid")
+}
+# Domain variables first, so a certificate generated later uses the same domain as the template's SNI/Host.
+tpl_vars_ordered() {
+  local rows; rows=$(tpl_vars "$1")
+  awk -F'\t' '$2=="shared.domain"||$2=="tls_name"||$2=="domain_to_handshake_tls"||$2=="domain_to_handshake_quic"' <<<"$rows"
+  awk -F'\t' '!($2=="shared.domain"||$2=="tls_name"||$2=="domain_to_handshake_tls"||$2=="domain_to_handshake_quic")' <<<"$rows"
 }
 is_bool() { [[ $1 == true || $1 == false ]]; }
 tpl_validator() { # type var -> name of the validator function for that prompt
@@ -1700,18 +1822,27 @@ open_proxy_guard() {
 # Runs the official-template flow; fills NODES_JSON etc. for tunnel_finalize.
 gen_template() {
   need_jq
-  local -a fams titles; mapfile -t fams < <(tpl_family_list)
-  local f; for f in "${fams[@]}"; do titles+=("$(tpl_family_field "$f" 2)"); done
-  local c; choose c "Official template family:" "${titles[@]}"
-  local fam=${fams[$((c-1))]} note; note=$(tpl_family_field "$fam" 3)
-  [[ -n $note ]] && warn "${note#raw: }"
-  local -a vars; mapfile -t vars < <(tpl_variants "$fam")
-  local variant=${vars[0]}
-  if ((${#vars[@]} > 1)); then choose c "Variant:" "${vars[@]}"; variant=${vars[$((c-1))]}; fi
-  local -a roles rl; mapfile -t roles < <(tpl_roles "$fam" "$variant")
-  local r; for r in "${roles[@]}"; do rl+=("$(role_label "$r")"); done
-  ROLE=${roles[0]}
-  if ((${#roles[@]} > 1)); then choose c "Which side is this server?" "${rl[@]}"; ROLE=${roles[$((c-1))]}; fi
+  local fam variant note c
+  if (( ${TPL_PRESET:-0} )); then
+    fam=${PAIRD[FAMILY]}; variant=${PAIRD[VARIANT]}; ROLE=$(counter_role "${PAIRD[ROLE]}")
+    note=$(tpl_family_field "$fam" 3)
+    info "Template from pairing code: $(tpl_family_field "$fam" 2) [$variant], side: ${ROLE^^}"
+    [[ -n $note ]] && warn "${note#raw: }"
+  else
+    local -a fams titles; mapfile -t fams < <(tpl_family_list)
+    local f; for f in "${fams[@]}"; do titles+=("$(tpl_family_field "$f" 2)"); done
+    choose c "Official template family:" "${titles[@]}"
+    fam=${fams[$((c-1))]}; note=$(tpl_family_field "$fam" 3)
+    [[ -n $note ]] && warn "${note#raw: }"
+    local -a vars; mapfile -t vars < <(tpl_variants "$fam")
+    variant=${vars[0]}
+    if ((${#vars[@]} > 1)); then choose c "Variant:" "${vars[@]}"; variant=${vars[$((c-1))]}; fi
+    local -a roles rl; mapfile -t roles < <(tpl_roles "$fam" "$variant")
+    local r; for r in "${roles[@]}"; do rl+=("$(role_label "$r")"); done
+    ROLE=${roles[0]}
+    if ((${#roles[@]} > 1)); then choose c "Which side is this server?" "${rl[@]}"; ROLE=${roles[$((c-1))]}; fi
+  fi
+  TPL_FAM=$fam; TPL_VARIANT=$variant
   local tid; tid=$(tpl_pick "$fam" "$variant" "$ROLE")
   [[ -n $tid ]] || { err "Template not found."; return 1; }
   if [[ $note == raw:* ]]; then
@@ -1725,7 +1856,8 @@ gen_template() {
   json=$(open_proxy_guard "$json")
   # client-side certificate verification for TLS/QUIC clients
   if jq -e 'any(.nodes[]; .type=="TlsClient" or .type=="QuicClient")' >/dev/null <<<"$json"; then
-    local vf=false; confirm "Is the server certificate self-signed (verify=false)?" y || vf=true
+    local vf=false; confirm "Is the server certificate self-signed (verify=false)?" y SELF_SIGNED || vf=true
+    TPL_SELF_SIGNED=$([[ $vf == false ]] && echo y || echo n)
     json=$(jq -c --argjson v "$vf" '(.nodes[] | select(.type=="TlsClient" or .type=="QuicClient") | .settings.verify) = $v' <<<"$json")
   fi
   if [[ $fam == tunnels/halfduplex-split-transports && $ROLE == client ]] && confirm "Swap directions (upload over KCP, download over TLS)?" n; then
@@ -1738,6 +1870,153 @@ gen_template() {
     if confirm "Add a user bandwidth limit (SpeedLimit) on the entry listener?" n; then TPL_SPEEDLIMIT=1; fi
   fi
   PREBUILT=2
+}
+
+# ----------------------------------------------------------------------------
+# [MODULE] pairing codes
+#   After one side is created, a code carries every value the other side needs
+#   (secrets, SNI, ports, Mux/encryption choices, addresses). 'ww join <code>' on
+#   the other server runs the same mode with the counterpart role and fills the
+#   answers in. The code is parsed as plain key=value data: nothing in it is ever
+#   executed, and every value still goes through the normal validators.
+# ----------------------------------------------------------------------------
+PAIR_PREFIX="WW1-"
+PAIR_WIZARD_VARS=(TRANSPORT_PORT SNI PASSWORD ENC_PASS MUX_N CARRIER VISITOR_HOST
+  IP_CLIENT IP_SERVER INNER_CLIENT INNER_SERVER TUN_MTU TUN_PORT FAKE_SRV_PORT FAKE_CLI_FROM FAKE_CLI_TO)
+# same-name template variables that mean different things on the two sides
+PAIR_TPL_SKIP=" tun_cidr port_to_listen certificate_path key_path listen_address socks_address socks_port user_port final_ip final_port "
+# client_var:server_var pairs that hold the same value under different names
+PAIR_TPL_EQUIV=(server_carrier_port:port_to_listen shared_port:client_tunnel_port
+  server.port:public-tls.port server.port:kcp-in.port server.port:quic-in.port
+  remote-server.port:public-listener.port tcp-out.port:tcp-in.port udp-out.port:udp-in.port
+  visitor_domain:visitor_ip ip_behind_domain_white:domain_to_handshake_reality)
+PAIR_TPL_SERVER_ADDR=" server_ip server_address server.address remote-server.address tcp-out.address udp-out.address transport.address carrier.address "
+PAIR_TPL_DOMAINS=(shared.domain tls_name domain_to_handshake_tls domain_to_handshake_quic)
+
+pairable() { # mode role
+  [[ $2 == client || $2 == server ]] || return 1
+  case $1 in portfwd|wireguard|authapi|custom) return 1;; esac
+}
+
+# Appends PAIR_* lines to the new tunnel's meta file (called from tunnel_finalize).
+pair_record() {
+  local d="$WW_TUNNELS/$TNAME" me v
+  pairable "$MODE" "$ROLE" || return 0
+  me=$(public_ip)
+  info "Pairing: the other server will connect to / whitelist this server by its address."
+  ask PAIR_ADDR "Public IP or domain of THIS server, as the other server sees it" "$me" is_host
+  {
+    printf 'PAIR_V=1\nPAIR_MODE=%s\nPAIR_ROLE=%s\nPAIR_NAME=%s\nPAIR_MYIP=%s\n' "$MODE" "$ROLE" "$TNAME" "$PAIR_ADDR"
+    if [[ $MODE == tpl:* ]]; then
+      printf 'PAIR_FAMILY=%s\nPAIR_VARIANT=%s\n' "$TPL_FAM" "$TPL_VARIANT"
+      local k; for k in "${!TVRAW[@]}"; do printf 'PAIR_tpl:%s=%s\n' "$k" "${TVRAW[$k]}"; done
+      [[ -n ${TPL_CERTDOM:-} ]] && printf 'PAIR_CERTDOM=%s\n' "$TPL_CERTDOM"
+      [[ -n ${TPL_SELF_SIGNED:-} ]] && printf 'PAIR_SELF_SIGNED=%s\n' "$TPL_SELF_SIGNED"
+    else
+      for v in "${PAIR_WIZARD_VARS[@]}"; do [[ -n ${!v:-} ]] && printf 'PAIR_%s=%s\n' "$v" "${!v}"; done
+      printf 'PAIR_ENC=%s\nPAIR_MUX=%s\nPAIR_FEC=%s\n' "$( ((ENC)) && echo y || echo n)" "$( ((MUX)) && echo y || echo n)" "$( ((FEC)) && echo y || echo n)"
+      if [[ -n ${CERT_SELF_SIGNED:-} ]]; then echo "PAIR_SELF_SIGNED=$CERT_SELF_SIGNED"     # this side holds the certificate
+      elif [[ $VERIFY == false ]]; then echo "PAIR_SELF_SIGNED=y"; else echo "PAIR_SELF_SIGNED=n"; fi
+    fi
+  } >>"$d/tunnel.meta"
+}
+
+pair_code() { # tunnel -> prints the code
+  local f="$WW_TUNNELS/$1/tunnel.meta"
+  grep -q '^PAIR_V=' "$f" 2>/dev/null || return 1
+  printf '%s%s\n' "$PAIR_PREFIX" "$(grep '^PAIR_' "$f" | sed 's/^PAIR_//' | gzip -9 -n | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+}
+
+pair_show() { # tunnel
+  local code; code=$(pair_code "$1") || { warn "No pairing data for '$1' (created before v2.2.0 or not a two-sided mode)."; return 1; }
+  line
+  printf '%sPairing code%s for the other server %s(contains secrets — share it privately)%s:\n\n%s\n\n' "$C_W" "$C_0" "$C_Y" "$C_0" "$code"
+  printf 'On the other server run:\n  %sww join %s%s\n' "$C_C" "$code" "$C_0"
+  printf 'or, if the manager is not installed there yet:\n  %scurl -fsSL -o ww.sh %s && sudo bash ww.sh join %s%s\n' "$C_C" "$MANAGER_RAW_URL" "$code" "$C_0"
+  line
+}
+
+# Decodes and validates a code into the PAIRD associative array.
+pair_decode() {
+  local code=${1#"$PAIR_PREFIX"} raw line k v n=0
+  [[ $1 == "$PAIR_PREFIX"* && $code =~ ^[A-Za-z0-9_-]+$ && ${#code} -le 12000 ]] || { err "Not a valid pairing code."; return 1; }
+  code=${code//-/+}; code=${code//_//}
+  while (( ${#code} % 4 )); do code+="="; done
+  raw=$(base64 -d <<<"$code" 2>/dev/null | gzip -dc 2>/dev/null | head -c 16384) || true
+  [[ -n $raw ]] || { err "Pairing code is damaged (copy it again, completely)."; return 1; }
+  declare -gA PAIRD=()
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    ((++n > 200)) && { err "Pairing code too large."; return 1; }
+    k=${line%%=*}; v=${line#*=}
+    [[ $line == *=* && $k =~ ^[A-Za-z0-9_.:@-]{1,64}$ && ${#v} -le 400 && $v != *[[:cntrl:]]* ]] || { err "Pairing code contains invalid data."; return 1; }
+    PAIRD[$k]=$v
+  done <<<"$raw"
+  [[ ${PAIRD[V]:-} == 1 ]] || { err "Unsupported pairing code version."; return 1; }
+  pairable "${PAIRD[MODE]:-}" "${PAIRD[ROLE]:-}" || { err "Pairing code has no valid mode/role."; return 1; }
+  if [[ ${PAIRD[MODE]} == tpl:* ]]; then
+    [[ -n ${PAIRD[FAMILY]:-} ]] && grep -q "^${PAIRD[FAMILY]}"$'\t' <<<"$WW_FAMILIES" || { err "Unknown template family in code."; return 1; }
+  else
+    local m found=0; for m in "${MODES[@]}"; do [[ ${m%%|*} == "${PAIRD[MODE]}" ]] && found=1; done
+    ((found)) || { err "Unknown mode in code (is this manager older than the other one?)."; return 1; }
+  fi
+}
+
+# Turns PAIRD (creator's values) into PREFILL answers for the counterpart role.
+pair_build_prefill() {
+  PREFILL=()
+  local cr=${PAIRD[ROLE]} jr; jr=$(counter_role "$cr")
+  if [[ ${PAIRD[MODE]} != tpl:* ]]; then
+    local v; for v in "${PAIR_WIZARD_VARS[@]}"; do [[ -n ${PAIRD[$v]:-} ]] && PREFILL[$v]=${PAIRD[$v]}; done
+    PREFILL[PEER_IP]=${PAIRD[MYIP]}
+    PREFILL[ENC]=${PAIRD[ENC]:-n}; PREFILL[MUX]=${PAIRD[MUX]:-n}; PREFILL[FEC]=${PAIRD[FEC]:-n}; PREFILL[RAW_OK]=y
+    unset 'PREFILL[VISITOR_HOST]'
+    # Reality: one side asks for the SNI (RealityClient), the other for the cover site (RealityServer)
+    if [[ ${PAIRD[MODE]} == *reality* || ( ${PAIRD[MODE]} == wg-relay && ${PAIRD[CARRIER]:-} == 1 ) ]]; then
+      local cover=${PAIRD[SNI]:-${PAIRD[VISITOR_HOST]:-}}
+      unset 'PREFILL[SNI]'
+      if [[ -n $cover ]]; then PREFILL[VISITOR_HOST]=$cover; is_domain "$cover" && PREFILL[SNI]=$cover; fi
+    fi
+    # TLS/QUIC: one side asks "self-signed?" (client), the other picks how to get a certificate (server)
+    PREFILL[SELF_SIGNED]=${PAIRD[SELF_SIGNED]:-n}
+    [[ ${PAIRD[SELF_SIGNED]:-} == y ]] && PREFILL[CERT_MODE]=1
+    return 0
+  fi
+  # ---- official templates
+  local tid; tid=$(tpl_pick "${PAIRD[FAMILY]}" "${PAIRD[VARIANT]}" "$jr")
+  [[ -n $tid ]] || { err "The template has no '$jr' side."; return 1; }
+  local var type def label x a b
+  while IFS=$'\t' read -r _ var type def label; do
+    [[ -z $var ]] && continue
+    if [[ -n ${PAIRD[tpl:$var]+x} && $PAIR_TPL_SKIP != *" $var "* && $var != *.address ]]; then
+      PREFILL[tpl:$var]=${PAIRD[tpl:$var]}; continue
+    fi
+    for x in "${PAIR_TPL_EQUIV[@]}"; do
+      a=${x%%:*}; b=${x#*:}
+      if [[ $jr == server && $var == "$b" && -n ${PAIRD[tpl:$a]+x} ]]; then PREFILL[tpl:$var]=${PAIRD[tpl:$a]}; continue 2; fi
+      if [[ $jr == client && $var == "$a" && -n ${PAIRD[tpl:$b]+x} ]]; then PREFILL[tpl:$var]=${PAIRD[tpl:$b]}; continue 2; fi
+    done
+    if [[ $jr == client && $PAIR_TPL_SERVER_ADDR == *" $var "* ]] || [[ $jr == server && $var == client_ip ]]; then
+      PREFILL[tpl:$var]=${PAIRD[MYIP]}; continue
+    fi
+    if [[ -n ${PAIRD[CERTDOM]:-} ]] && printf '%s\n' "${PAIR_TPL_DOMAINS[@]}" | grep -qx -- "$var"; then
+      PREFILL[tpl:$var]=${PAIRD[CERTDOM]}
+    fi
+  done < <(tpl_vars "$tid")
+  # certificate domain for a joiner that holds the certificate (asked via 'dom')
+  PREFILL[dom]=${PAIRD[CERTDOM]:-}
+  for x in "${PAIR_TPL_DOMAINS[@]}"; do [[ -n ${PAIRD[tpl:$x]:-} ]] && { PREFILL[dom]=${PAIRD[tpl:$x]}; break; }; done
+  [[ -z ${PREFILL[dom]} ]] && unset 'PREFILL[dom]'
+  PREFILL[SELF_SIGNED]=${PAIRD[SELF_SIGNED]:-y}
+  [[ ${PAIRD[SELF_SIGNED]:-} == y ]] && PREFILL[CERT_MODE]=1
+  return 0
+}
+
+tunnel_join() { # code
+  pair_decode "$1" || return 1
+  local jr; jr=$(counter_role "${PAIRD[ROLE]}")
+  info "Pairing code: mode ${PAIRD[MODE]}, other side is ${PAIRD[ROLE]^^} at ${PAIRD[MYIP]} -> creating the ${jr^^} side here."
+  JOIN=1 tunnel_create join
 }
 
 # ----------------------------------------------------------------------------
@@ -1778,17 +2057,27 @@ svc_state() {
   if has_systemd; then systemctl is-active "waterwall@$1" 2>/dev/null; else echo "n/a"; fi
 }
 
-tunnel_create() {
+tunnel_create() { # [join]
   core_bin >/dev/null || { warn "Core not installed yet."; if confirm "Install now?" y; then core_install || return 1; else return 1; fi; }
   need_jq
-  local c
-  choose c "How do you want to create the tunnel?" \
-    "Quick wizard (15 guided modes: TCP/TLS/Reality/QUIC/KCP, Ping, FakeTCP, WireGuard, API)" \
-    "Official templates (all 86 configs from the docs: BitSwap, ProtoSwap, BGP4, RTMP, HalfDuplex, Stripe, VLESS/VMess/Trojan, SOCKS/HTTP, WebSocket, TUN ...)" \
-    "Import my own config.json" "Back"
-  [[ $c == 4 ]] && return 0
-  local how=$c
-  ask TNAME "Tunnel name (a-z, 0-9, - _)" "tun$(( $(tunnel_count) + 1 ))" is_new_tunnel
+  local c how
+  if [[ ${1:-} == join ]]; then how=join
+  else
+    PREFILL=()
+    choose c "How do you want to create the tunnel?" \
+      "Quick wizard (${#MODES[@]} guided modes: TCP/TLS/Reality/QUIC/KCP, Ping, FakeTCP, WireGuard, WireGuard relay, API)" \
+      "Official templates (all $(grep -c . <<<"$WW_TEMPLATES") configs from the docs: BitSwap, ProtoSwap, BGP4, RTMP, HalfDuplex, Stripe, VLESS/VMess/Trojan, SOCKS/HTTP, WebSocket, TUN ...)" \
+      "Import my own config.json" "Join with a pairing code from the other server" "Back"
+    [[ $c == 5 ]] && return 0
+    if [[ $c == 4 ]]; then
+      local code; ask code "Paste the pairing code (starts with $PAIR_PREFIX)" "" is_safe_str
+      tunnel_join "$code"; return
+    fi
+    how=$c
+  fi
+  local defname="tun$(( $(tunnel_count) + 1 ))"
+  if [[ $how == join && -n ${PAIRD[NAME]:-} ]]; then defname=${PAIRD[NAME]}; [[ -e $WW_TUNNELS/$defname ]] && defname="${defname}-2"; fi
+  ask TNAME "Tunnel name (a-z, 0-9, - _)" "$defname" is_new_tunnel
   local d="$WW_TUNNELS/$TNAME"
   # remove the half-created tunnel if the wizard is interrupted (Ctrl+C, closed input, error)
   WW_CREATING=$d
@@ -1797,18 +2086,29 @@ tunnel_create() {
   # reset per-run globals
   NODES=(); META=(); CORE_MTU=1500; SNI=""; VISITOR_HOST=""; PASSWORD=""; VERIFY=true; MUX=0; ENC=0; ENC_PASS=""; FEC=0
   SL_MBPS=0; SL_MODE=all-lines; PREBUILT=0; TEMPLATE_JSON=""; TPL_SPEEDLIMIT=0; ROLE=client; MODE=""
+  RELAY_BLOCK_WG=0; CARRIER=""; WG_PORT=""; CERT_SELF_SIGNED=""; PEER_IP=""; TRANSPORT_PORT=""
+  TPL_FAM=""; TPL_VARIANT=""; TPL_CERTDOM=""; TPL_SELF_SIGNED=""; [[ $how == join ]] || TPL_PRESET=0
+  IP_CLIENT=""; IP_SERVER=""; INNER_CLIENT=""; INNER_SERVER=""; TUN_MTU=""; TUN_PORT=""
+  FAKE_SRV_PORT=""; FAKE_CLI_FROM=""; FAKE_CLI_TO=""; MUX_N=4
   mkdir -p "$d"
   local rc=0
+  if [[ $how == join ]]; then
+    pair_build_prefill || { rm -rf "${d:?}"; WW_CREATING=""; trap - INT TERM EXIT; return 1; }
+    if [[ ${PAIRD[MODE]} == tpl:* ]]; then how=2; TPL_PRESET=1
+    else how=1; MODE=${PAIRD[MODE]}; ROLE=$(counter_role "${PAIRD[ROLE]}"); fi
+  fi
   case $how in
     1)
-      local -a labels=(); local m; for m in "${MODES[@]}"; do labels+=("${m#*|}"); done
-      choose c "Tunnel type:" "${labels[@]}"
-      MODE=${MODES[$((c-1))]%%|*}
-      case $MODE in
-        portfwd|wireguard|authapi) ROLE=single;;
-        *) local r; choose r "Which server is this?" "CLIENT (entry, users connect here)" "SERVER (exit, final service runs here)"
-           [[ $r == 2 ]] && ROLE=server;;
-      esac
+      if [[ -z $MODE ]]; then
+        local -a labels=(); local m; for m in "${MODES[@]}"; do labels+=("${m#*|}"); done
+        choose c "Tunnel type:" "${labels[@]}"
+        MODE=${MODES[$((c-1))]%%|*}
+        case $MODE in
+          portfwd|wireguard|authapi) ROLE=single;;
+          *) local r; choose r "Which server is this?" "CLIENT (entry, users connect here)" "SERVER (exit, final service runs here)"
+             [[ $r == 2 ]] && ROLE=server;;
+        esac
+      fi
       case $MODE in
         portfwd)          gen_portfwd;;
         direct-tcp)       gen_direct tcp;;
@@ -1825,6 +2125,7 @@ tunnel_create() {
         faketcp)          gen_faketcp;;
         wireguard)        gen_wireguard;;
         authapi)          gen_authapi;;
+        wg-relay)         gen_wgrelay;;
       esac || rc=1;;
     2) gen_template || rc=1;;
     3) MODE=custom; gen_import || rc=1;;
@@ -1861,6 +2162,7 @@ tunnel_finalize() {
       && printf 'SPEED_LIMIT=%s MB/s (%s)\n' "$((10#$SL_MBPS))" "$SL_MODE" >>"$d/tunnel.meta"
   fi
   if (( TPL_SPEEDLIMIT )); then tunnel_speed_limit_menu_nosvc "$TNAME"; fi
+  (( ${RELAY_BLOCK_WG:-0} )) && relay_write_hooks "$TNAME" "$WG_PORT"
   local problems=""
   if [[ $MODE != custom ]]; then
     validate_json "$d/core.json" || problems="core.json invalid"
@@ -1868,13 +2170,26 @@ tunnel_finalize() {
     if [[ -n $problems ]]; then err "Generated config failed self-check (please report):"; echo "$problems"; return 1; fi
   fi
   ok "Tunnel '$TNAME' created  ($(mode_desc "$MODE"), role: ${ROLE^^})"
+  [[ ${JOIN:-0} == 1 ]] && printf 'JOINED=%s\n' "${PAIRD[MYIP]}" >>"$d/tunnel.meta"
+  pair_record
   firewall_open "$TNAME"
   service_install_unit
   if confirm "Start '$TNAME' now and enable on boot?" y; then svc enable "$TNAME"; svc restart "$TNAME"; fi
   tunnel_info "$TNAME"
   [[ $MODE == wireguard ]] && wg_show_client "$TNAME" "$WG_LAST"
   [[ $MODE == authapi ]] && authapi_help "$TNAME"
+  [[ ${JOIN:-0} == 1 ]] || pair_show "$TNAME" 2>/dev/null
+  [[ $MODE == wg-relay ]] && relay_help "$TNAME"
   return 0
+}
+
+relay_help() {
+  if [[ $(meta_get "$1" ROLE) == client ]]; then
+    info "In every user's WireGuard config set:  Endpoint = <this relay's IP or domain>:$(meta_get "$1" USER_PORT)"
+    info "Keys and peers stay on the final server's WireGuard — nothing about users is stored on this relay."
+  else
+    info "The relay tunnel delivers WireGuard packets to 127.0.0.1:$(meta_get "$1" WG_PORT). Keep that WireGuard running."
+  fi
 }
 
 tunnel_speed_limit_menu_nosvc() { # same as menu but no restart (used during creation)
@@ -1907,15 +2222,19 @@ tunnel_info() {
   [[ -d $d ]] || { err "No such tunnel: $n"; return 1; }
   line
   printf '%sTunnel:%s %s   %sstate:%s %s\n' "$C_W" "$C_0" "$n" "$C_W" "$C_0" "$(svc_state "$n")"
-  grep -vE '^(SHARE_|PASSWORD=|ENCRYPTION=)' "$d/tunnel.meta" | sed 's/^/  /'
+  grep -vE '^(SHARE_|PAIR_|JOINED=|PASSWORD=|ENCRYPTION=)' "$d/tunnel.meta" | sed 's/^/  /'
   printf '  config: %s\n' "$d/config.json"
   local mode role cr; mode=$(meta_get "$n" MODE); role=$(meta_get "$n" ROLE); cr=$(counter_role "$role")
-  if [[ -n $cr ]]; then
+  local joined; joined=$(meta_get "$n" JOINED)
+  if [[ -n $joined && -n $cr ]]; then
+    printf '\n%sPaired%s with the %s side at %s via a pairing code — both sides use the same values.\n' "$C_G" "$C_0" "${cr^^}" "$joined"
+  elif [[ -n $cr ]]; then
     local how="the same quick-wizard type ($mode)"
     [[ $mode == tpl:* ]] && how="the same official template ($(meta_get "$n" FAMILY), variant: $(meta_get "$n" VARIANT))"
     printf '\n%sOn the other server%s create %s with role %s, using the SAME values:\n' "$C_Y" "$C_0" "$how" "${cr^^}"
     grep -E '^(SNI|PASSWORD|MUX|ENCRYPTION|KCP_FEC|SHARE_.*)=' "$d/tunnel.meta" | sed -e 's/^SHARE_//' -e 's/^/   • /'
     echo "   • matching ports / IPs"
+    grep -q '^PAIR_V=' "$d/tunnel.meta" && printf '   %sEasier:%s run %sww pair-code %s%s here and %sww join <code>%s there.\n' "$C_G" "$C_0" "$C_C" "$n" "$C_0" "$C_C" "$C_0"
   fi
   line
 }
@@ -1927,7 +2246,7 @@ tunnel_list() {
     [[ -z $n ]] && continue; any=1
     local st; st=$(svc_state "$n"); local col=$C_R; [[ $st == active ]] && col=$C_G
     printf '%-16s %-24s %-7s %s%-9s%s %s\n' "$n" "$(meta_get "$n" MODE | cut -c1-24)" "$(meta_get "$n" ROLE)" \
-      "$col" "$st" "$C_0" "$(grep -E '^(USER_PORT|TRANSPORT_PORT|PEER|FINAL|WG_PORT|API)=' "$WW_TUNNELS/$n/tunnel.meta" | tr '\n' ' ')"
+      "$col" "$st" "$C_0" "$(grep -E '^(USER_PORT|TRANSPORT_PORT|PEER|FINAL|FINAL_UDP|WG_PORT|API)=' "$WW_TUNNELS/$n/tunnel.meta" | tr '\n' ' ')"
   done < <(tunnel_list_names)
   ((any)) || info "No tunnels yet — choose 'Create new tunnel'."
 }
@@ -1993,6 +2312,12 @@ tunnel_health() {
     if timeout 3 bash -c "</dev/tcp/${final%:*}/${final##*:}" 2>/dev/null; then ok "Final service $final reachable"
     else warn "Final service $final NOT reachable (is xray/your app running?)"; fi
   fi
+  local wgp; wgp=$(meta_get "$n" WG_PORT)
+  if [[ $(meta_get "$n" MODE) == wg-relay && -n $wgp ]]; then
+    local udps; udps=$(ss -Hlnu 2>/dev/null | awk '{print $5}')
+    if grep -qE "[:.]$wgp\$" <<<"$udps"; then ok "WireGuard is listening on UDP $wgp"
+    else warn "Nothing listens on UDP $wgp — is WireGuard running on this server?"; fi
+  fi
   if [[ $(meta_get "$n" MODE) == wireguard ]]; then
     local tun; tun=$(wg_conf_get "$n" TUN)
     ip link show "$tun" >/dev/null 2>&1 && ok "TUN $tun exists" || warn "TUN $tun missing"
@@ -2033,6 +2358,7 @@ tunnel_manage() {
                    "Show shared secrets (for the other server)" "Bandwidth limit (SpeedLimit)" "Auto-restart schedule"
                    "Enable on boot" "Disable on boot" "Delete")
     local mode; mode=$(meta_get "$n" MODE)
+    grep -q '^PAIR_V=' "$WW_TUNNELS/$n/tunnel.meta" && opts+=("Show pairing code (for the other server)")
     [[ $mode == wireguard ]] && opts+=("WireGuard clients")
     [[ $mode == authapi ]] && opts+=("API usage help")
     opts+=("Back")
@@ -2051,6 +2377,7 @@ tunnel_manage() {
       "Disable on boot") svc disable "$n"; pause;;
       Delete) tunnel_delete "$n"; pause; [[ -d "$WW_TUNNELS/$n" ]] || return;;
       "WireGuard clients") wg_menu "$n";;
+      "Show pairing code"*) pair_show "$n"; pause;;
       "API usage help") authapi_help "$n"; pause;;
       Back) return;;
     esac
@@ -2360,6 +2687,8 @@ WaterWall Manager v$SCRIPT_VERSION
   ww start|stop|restart|enable|disable|status|logs|health|info <name>
   ww limit <name>         set/remove a bandwidth limit
   ww wg-add <name> [client]   add a WireGuard client and print its config
+  ww pair-code <name>     show the pairing code for the other server
+  ww join <code>          create the other side of a tunnel from a pairing code
   ww restart-all | stop-all
   ww delete <name>
   ww templates            list all official templates
@@ -2390,6 +2719,8 @@ main() {
     limit)       tunnel_exists "${1:-}"; tunnel_speed_limit_menu "$1";;
     wg-add)      tunnel_exists "${1:-}"; [[ $(meta_get "$1" MODE) == wireguard ]] || die "$1 is not a WireGuard tunnel"
                  wg_add_client "$1" "${2:-}" && { svc restart "$1"; wg_show_client "$1" "$WG_LAST"; };;
+    pair-code)   tunnel_exists "${1:-}"; pair_show "$1";;
+    join)        [[ -n ${1:-} ]] || die "Usage: ww join <pairing code>"; self_install; tunnel_join "$1";;
     restart-all) svc_all restart;;
     stop-all)    svc_all stop;;
     delete|rm)   tunnel_exists "${1:-}"; tunnel_delete "$1";;
