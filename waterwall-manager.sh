@@ -14,7 +14,7 @@ set -o pipefail
 # ----------------------------------------------------------------------------
 # [MODULE] constants
 # ----------------------------------------------------------------------------
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.2.1"
 readonly REPO="radkesvat/WaterWall"
 # Where 'ww join' tells the other server to download this manager from (change if you fork/rename the repo)
 MANAGER_RAW_URL="${MANAGER_RAW_URL:-https://raw.githubusercontent.com/javadkhammari/waterwall-manager./main/waterwall-manager.sh}"
@@ -2612,7 +2612,7 @@ settings_menu() {
     printf '  GitHub proxy prefix : %s\n  Default log level   : %s\n' "${GH_PROXY:-<none>}" "$LOG_LEVEL"
     line
     local c; choose c "Settings:" "Set GitHub download proxy (for filtered networks)" "Set default log level" \
-      "Apply log level to all tunnels now" "Back"
+      "Apply log level to all tunnels now" "Update this manager (ww) from GitHub" "Back"
     case $c in
       1) local p; read -rp "Proxy prefix (e.g. https://ghproxy.net/ , empty = none): " p || true
          if [[ -z $p || $p =~ ^https?://[^[:space:]\'\"]+$ ]]; then GH_PROXY=$p; save_settings; ok "Saved."; else warn "Invalid URL"; fi; pause;;
@@ -2621,18 +2621,49 @@ settings_menu() {
            [[ -n $n ]] && jq_inplace "$WW_TUNNELS/$n/core.json" --arg L "$LOG_LEVEL" '.log.core.loglevel=$L | .log.network.loglevel=$L | .log.internal.loglevel=$L'
          done < <(tunnel_list_names)
          ok "Updated; restarting all."; svc_all restart; pause;;
-      4) return;;
+      4) self_update; pause;;
+      5) return;;
     esac
   done
 }
 
+# Downloads the manager from MANAGER_RAW_URL and installs it as 'ww' (after sanity checks).
+manager_download_install() {
+  [[ -n ${WW_OFFLINE:-} ]] && return 1
+  local tmp; tmp=$(mktemp) || return 1
+  if curl -fsSL --max-time 60 "$(gh_url "$MANAGER_RAW_URL")" -o "$tmp" \
+     && [[ $(head -c 300 "$tmp") == *'WaterWall Manager'* ]] && bash -n "$tmp" 2>/dev/null; then
+    mkdir -p "$(dirname "$SELF_PATH")"
+    install -m 0755 "$tmp" "$SELF_PATH"; local rc=$?
+    rm -f "$tmp"; return $rc
+  fi
+  rm -f "$tmp"; return 1
+}
+
 self_install() {
   local src; src=$(readlink -f "$0" 2>/dev/null)
-  [[ -f $src && -r $src ]] || return 0           # e.g. run via 'bash <(curl ...)'
+  if [[ ! -f $src || ! -r $src ]]; then
+    # run via 'bash <(curl ...)': there is no file to copy, so fetch a copy for 'ww'
+    [[ -x $SELF_PATH ]] && return 0
+    if manager_download_install; then ok "Installed manager as '${SELF_PATH##*/}' — run 'ww' anytime."
+    else warn "Could not save a copy as '${SELF_PATH##*/}' (download failed). Run the one-line installer again later."; fi
+    return 0
+  fi
   [[ $src == "$(readlink -f "$SELF_PATH" 2>/dev/null)" ]] && return 0
-  [[ $(head -c 200 "$src") == *'WaterWall Manager'* ]] || return 0
+  [[ $(head -c 300 "$src") == *'WaterWall Manager'* ]] || return 0
   mkdir -p "$(dirname "$SELF_PATH")"
   install -m 0755 "$src" "$SELF_PATH" 2>/dev/null && ok "Installed manager as '${SELF_PATH##*/}' — run 'ww' anytime."
+}
+
+self_update() {
+  info "Updating the manager from $MANAGER_RAW_URL ..."
+  local old=$SCRIPT_VERSION new
+  if manager_download_install; then
+    new=$(grep -m1 -oE 'SCRIPT_VERSION="[^"]+"' "$SELF_PATH" | cut -d'"' -f2)
+    if [[ $new == "$old" ]]; then ok "Already up to date (v$old)."; else ok "Updated: v$old -> v$new. Run 'ww' again."; fi
+  else
+    err "Update failed (GitHub unreachable?). If GitHub is filtered, set a download proxy in Settings."; return 1
+  fi
 }
 
 uninstall_all() {
@@ -2692,6 +2723,7 @@ WaterWall Manager v$SCRIPT_VERSION
   ww restart-all | stop-all
   ww delete <name>
   ww templates            list all official templates
+  ww update               update this manager to the latest version from GitHub
   ww check                system & prerequisites check
   ww speedtest-server | speedtest-client
   ww optimize | backup | restore <file> | uninstall
@@ -2724,6 +2756,7 @@ main() {
     restart-all) svc_all restart;;
     stop-all)    svc_all stop;;
     delete|rm)   tunnel_exists "${1:-}"; tunnel_delete "$1";;
+    update)      self_update;;
     templates)   awk -F'\t' '{printf "%-34s %-28s %-8s %s\n", $1, $3, $4, $2}' <<<"$WW_TEMPLATES";;
     check)       system_check;;
     speedtest-server) speedtest_server;;

@@ -109,34 +109,35 @@ These screenshots were taken from the real script output in dry-run mode
 
 ## Installation
 
-Copy the script to the server and run it:
+As root, run:
 
 ```bash
-scp waterwall-manager.sh root@SERVER:/root/
-ssh root@SERVER
-bash /root/waterwall-manager.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/javadkhammari/waterwall-manager./main/waterwall-manager.sh)
 ```
 
-On the first run it installs itself as `ww`, so afterwards you can run `ww`
-from anywhere.
-
-If the repository is private, download it with a fine-grained personal access
-token that has read access to this repository only:
+If you log in as a normal user with `sudo`:
 
 ```bash
-curl -fsSL -H "Authorization: token YOUR_TOKEN" \
-  -o waterwall-manager.sh \
-  "https://raw.githubusercontent.com/javadkhammari/waterwall-manager./main/waterwall-manager.sh"
-bash waterwall-manager.sh
+curl -fsSL -o ww.sh https://raw.githubusercontent.com/javadkhammari/waterwall-manager./main/waterwall-manager.sh && sudo bash ww.sh
 ```
+
+The first run installs the manager as `ww`, so afterwards just run `ww`.
+Update it later with `ww update` (or **Settings → Update this manager**).
 
 ### Filtered networks
 
 If GitHub is blocked on the server:
 
-- set a download proxy prefix in **Settings** (for example `https://ghproxy.net/`), or
-- download a `Waterwall-linux-*.zip` release elsewhere, copy it to the server and
-  run `ww install-zip /path/to/file.zip`.
+- download `waterwall-manager.sh` on another machine, copy it over and run it:
+
+  ```bash
+  scp waterwall-manager.sh root@SERVER:/root/
+  ssh root@SERVER bash /root/waterwall-manager.sh
+  ```
+
+- for the WaterWall core, set a download proxy prefix in **Settings** (for
+  example `https://ghproxy.net/`), or download a `Waterwall-linux-*.zip` release
+  elsewhere, copy it to the server and run `ww install-zip /path/to/file.zip`.
 
 ## Concepts
 
@@ -162,9 +163,8 @@ way is a pairing code (below).
 
    ```bash
    ww join WW1-...
-   # or, if the manager is not installed there yet:
-   curl -fsSL -o ww.sh https://raw.githubusercontent.com/javadkhammari/waterwall-manager./main/waterwall-manager.sh
-   sudo bash ww.sh join WW1-...
+   # or, if the manager is not installed there yet (as root):
+   bash <(curl -fsSL https://raw.githubusercontent.com/javadkhammari/waterwall-manager./main/waterwall-manager.sh) join WW1-...
    ```
 
    It creates the matching side and only asks for things that are local to
@@ -221,6 +221,7 @@ Command line:
 | `ww restart-all` / `ww stop-all` | Control all tunnels |
 | `ww delete <name>` | Delete a tunnel |
 | `ww templates` | List all official templates |
+| `ww update` | Update this manager to the latest version from GitHub |
 | `ww check` | System and prerequisites check |
 | `ww speedtest-server` / `ww speedtest-client` | Run a speed test |
 | `ww optimize` | Apply BBR and network tuning |
