@@ -27,7 +27,7 @@ tunnel as its own systemd service.
   [WaterWall docs](https://radkesvat.github.io/WaterWall-Docs/) examples. They
   include BitSwap + Mux, ProtoSwap, BGP4, RTMP/RTMPS, HalfDuplex, ConnectionStripe,
   Ping/Fake TCP with TUN, VLESS/VMess/Trojan, SOCKS5/HTTP proxies, WebSocket and
-  SOCKS5 over RTMP + Reality.
+  SOCKS5 over RTMP + Reality (needs WaterWall v1.6.0 or newer on both sides).
 - **Import your own config**: from a file or pasted JSON, with `$variable$`
   placeholders supported.
 - **Optional layers**: ChaCha20 encryption for TCP/KCP, KCP FEC, Mux, and a
@@ -42,6 +42,10 @@ tunnel as its own systemd service.
   check, and network tuning (BBR, buffers, file limits).
 - **Self-check**: every generated config is validated (JSON, duplicate names,
   unknown node references) before it is saved.
+- **Safety checks**: warns when a mode needs a newer core than the installed one
+  and offers to update. It also warns before using a big, often IP-whitelisted
+  site as the Reality cover site, and before exposing a SOCKS5/HTTP proxy
+  without a password on a public address.
 
 ## Screenshots
 
@@ -190,8 +194,17 @@ Command line:
 - **Self-signed certificates** need `verify=false` on the client side. The
   wizard asks about this. Use a real certificate (Let's Encrypt or certbot)
   when you can.
-- **Local SOCKS5/HTTP proxy templates** have no authentication. Keep them on
-  `127.0.0.1` or behind a firewall, or anyone can use them as an open proxy.
+- **SOCKS5/HTTP proxies without a password** (local proxies and the client
+  side of the proxy templates) must stay on `127.0.0.1` or behind a firewall,
+  or anyone can use them as an open proxy. The script asks before making one
+  public.
+- **Reality cover site**: use a normal, real HTTPS site with a valid
+  certificate, and the same one on both sides. Avoid Google and other big sites
+  that are often IP-whitelisted.
+- **RTMP `rtmp_url` / `tc-url`**: this is the URL announced in the RTMP
+  handshake. A real streaming host (the default is
+  `rtmp://live.restream.io/waterwall`) looks more natural. Keep the
+  `/waterwall` path.
 - **The management API** is not encrypted. Keep it on `127.0.0.1` (the default).
 - **XOR obfuscation** in BitSwap/ProtoSwap is not encryption.
 

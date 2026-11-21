@@ -14,7 +14,7 @@ set -o pipefail
 # ----------------------------------------------------------------------------
 # [MODULE] constants
 # ----------------------------------------------------------------------------
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly REPO="radkesvat/WaterWall"
 WW_ROOT="${WW_ROOT:-}"                          # set for dry-run/testing (e.g. /tmp/wwtest)
 WW_HOME="${WW_ROOT}/opt/waterwall"
@@ -134,6 +134,17 @@ is_new_tunnel() {
   warn "Name exists or is invalid (use a-z 0-9 - _ , max 32)."; return 1
 }
 
+# Reality needs a normal, real HTTPS site. Big sites are often IP-whitelisted, which hurts.
+reality_site_ok() {
+  if [[ $1 =~ (^|\.)(google|youtube|gstatic|googleapis|googlevideo|microsoft|bing|apple|icloud|cloudflare|amazon|amazonaws|facebook|instagram|whatsapp|github|yahoo|twitter)\.[a-z.]+$ ]]; then
+    warn "$1 is a big, often IP-whitelisted site — a normal, less famous HTTPS site works better for Reality."
+    confirm "Use $1 anyway?" n || return 1
+  fi
+  return 0
+}
+is_reality_site() { is_domain "$1" && reality_site_ok "$1"; }
+is_reality_host() { if is_ip "$1"; then return 0; fi; is_reality_site "$1"; }
+
 json_str() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "$s"; }
 ip_cidr()  { if is_ipv6 "$1"; then printf '%s/128' "$1"; else printf '%s/32' "$1"; fi; }
 rand_pass() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c "${1:-24}"; }
@@ -243,7 +254,30 @@ asset_candidates() {
 resolve_latest_tag() {
   local loc
   loc=$(curl -fsSI --max-time 15 "$(gh_url "https://github.com/$REPO/releases/latest")" 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | tail -n1)
-  [[ $loc == */tag/* ]] && echo "${loc##*/tag/}"
+  if [[ $loc == */tag/* ]]; then echo "${loc##*/tag/}"; return 0; fi
+  # fallback: the latest/download redirect names the tag (.../releases/download/<tag>/<asset>)
+  loc=$(curl -s -o /dev/null -r 0-0 --max-time 15 -w '%{redirect_url}' \
+        "$(gh_url "https://github.com/$REPO/releases/latest/download/${KNOWN_LINUX_ASSETS[1]}")" 2>/dev/null)
+  [[ $loc =~ /releases/download/([^/]+)/ ]] && echo "${BASH_REMATCH[1]}"
+}
+
+# Installed core tag (e.g. v1.6.0), or empty when unknown (local zip / unresolved latest).
+core_tag() { grep -oE '^v?[0-9]+(\.[0-9]+)+' "$WW_HOME/VERSION" 2>/dev/null | head -n1; }
+version_ge() { [[ "$(printf '%s\n%s\n' "${2#v}" "${1#v}" | sort -V | head -n1)" == "${2#v}" ]]; }   # $1 >= $2
+
+# Warn (and offer an update) when a template needs a newer core than the installed one.
+require_core_version() { # min_tag
+  local min=$1 cur; cur=$(core_tag)
+  if [[ -z $cur ]]; then
+    warn "This mode needs WaterWall $min or newer on BOTH sides; the installed version is unknown."
+    if confirm "Install/update the core to the latest release now?" y; then core_install latest auto || return 1; fi
+  elif ! version_ge "$cur" "$min"; then
+    warn "This mode needs WaterWall $min or newer on BOTH sides; installed: $cur."
+    if confirm "Update the core to the latest release now?" y; then core_install latest auto || return 1
+    else confirm "Continue anyway (it will probably not work)?" n || return 1; fi
+  else
+    ok "Core $cur is new enough (needs $min). Make sure the other side runs $min or newer too."
+  fi
 }
 
 download_url() { # tag asset
@@ -536,9 +570,11 @@ collect_transport_params() { # kind side(client|server)
       fi;;
     reality)
       if [[ $side == client ]]; then
-        ask SNI "Reality SNI (real site the server shows to strangers)" "${SNI:-www.speedtest.net}" is_domain
+        info "Reality SNI: a normal, real HTTPS site (not Google or other big IP-whitelisted sites). Same on both sides."
+        ask SNI "Reality SNI (cover site)" "${SNI:-}" is_reality_site
       else
-        local vh; ask vh "Real site for non-authenticated visitors (domain or IP)" "www.speedtest.net" is_host
+        info "Cover site: a normal, real HTTPS site (not Google or other big IP-whitelisted sites); use the same as the client's SNI."
+        local vh; ask vh "Real site for non-authenticated visitors (domain or IP)" "" is_reality_host
         VISITOR_IP=$vh
         if ! is_ip "$vh"; then
           VISITOR_IP=$(resolve4 "$vh")
@@ -970,31 +1006,31 @@ gen_authapi() { # uses $TNAME
 # ----------------------------------------------------------------------------
 # --- generated from the official WaterWall-Docs examples (github.com/radkesvat/WaterWall-Docs) ---
 WW_FAMILIES=$(cat <<'__WWFAM__'
-tunnels/bitswap-mux	BitSwap + Mux (TCP flag swap, raw socket + TUN)	raw: Needs root, iproute2, iptables, kernel NFQUEUE + bpf match. RawSocket captures ALL TCP from the peer public IP (SSH between the two servers breaks). Use the SAME flag variant on both servers. Uses wtun1 (10.10.0.0/24) and, on the server side, also wtun2 (10.20.0.0/24).
-tunnels/protoswap	ProtoSwap (IP protocol swap, raw socket + TUN)	raw: Needs root, iproute2, iptables, NFQUEUE + bpf. Protocol number is an IPv4 protocol (not a port); avoid 6 and 17. Captures all packets of that protocol from the peer. XOR is not encryption.
-tunnels/direct-bgp4	Direct BGP4 (looks like BGP traffic)	
-tunnels/reverse-bgp4	Reverse BGP4	
-tunnels/direct-rtmp	Direct RTMP / RTMPS (looks like live streaming)	RTMPS needs a certificate on the server side; plain RTMP has no encryption.
-tunnels/halfduplex-split-transports	HalfDuplex: upload over TLS, download over KCP	Upload and download use different transports. UUID and KCP settings must match on both sides.
-tunnels/connection-stripe-tls	ConnectionStripe: parallel TLS connections	Both servers must use the same variant (with or without Mux).
-tunnels/ping	ICMP Ping tunnel (bridges or TUN)	raw: Needs root, iptables, NFQUEUE + bpf. Allow ICMP echo requests both ways. Plain ping between the two servers stops working while active.
-tunnels/fake-tcp-header	Fake TCP header (bridges or TUN/GRE)	raw: Needs root, iptables, NFQUEUE + bpf. Captures ALL TCP from the peer public IP (SSH between the servers breaks). Allow the fake ports between both IPs.
-tunnels/direct-tls	Direct TLS (official)	
-tunnels/direct-reality	Direct Reality (official)	
-tunnels/direct-quic	Direct QUIC (official)	
-tunnels/direct-kcp	Direct KCP (official)	
-tunnels/reverse-tls	Reverse TLS (official)	
-tunnels/reverse-reality	Reverse Reality (official)	
-tunnels/reverse-quic	Reverse QUIC (official)	
-tunnels/reverse-kcp	Reverse KCP (official)	
-proxies/local-proxies	Local SOCKS5 / HTTP proxy server	No authentication: keep the listener on 127.0.0.1 or firewall it, otherwise it is an open proxy.
-proxies/protocol-proxies	VLESS / VMess / Trojan over TLS	UUID/password must match on client and server. Server needs a TLS certificate.
-proxies/websocket	VMess over WebSocket + TLS	
-proxies/socks-mux	SOCKS5 + Router + VLESS + Mux + TLS	
-proxies/kcp	SOCKS5 -> VLESS + Mux + TLS over KCP	
-proxies/quic	SOCKS5 -> VLESS + Mux over QUIC	
-proxies/rtmp	SOCKS5 -> VLESS over RTMPS	
-proxies/socks5-rtmp-reality	SOCKS5 over RTMP + Reality	
+tunnels/bitswap-mux	BitSwap + Mux (TCP flag swap, raw socket + TUN)	raw: Needs root, iproute2, iptables, kernel NFQUEUE + bpf match. RawSocket captures ALL TCP from the peer public IP (SSH between the two servers breaks). Use the SAME flag variant on both servers. Uses wtun1 (10.10.0.0/24) and, on the server side, also wtun2 (10.20.0.0/24).	
+tunnels/protoswap	ProtoSwap (IP protocol swap, raw socket + TUN)	raw: Needs root, iproute2, iptables, NFQUEUE + bpf. Protocol number is an IPv4 protocol (not a port); avoid 6 and 17. Captures all packets of that protocol from the peer. XOR is not encryption.	
+tunnels/direct-bgp4	Direct BGP4 (looks like BGP traffic)		
+tunnels/reverse-bgp4	Reverse BGP4		
+tunnels/direct-rtmp	Direct RTMP / RTMPS (looks like live streaming)	RTMPS needs a certificate on the server side; plain RTMP has no encryption.	
+tunnels/halfduplex-split-transports	HalfDuplex: upload over TLS, download over KCP	Upload and download use different transports. UUID and KCP settings must match on both sides.	
+tunnels/connection-stripe-tls	ConnectionStripe: parallel TLS connections	Both servers must use the same variant (with or without Mux).	
+tunnels/ping	ICMP Ping tunnel (bridges or TUN)	raw: Needs root, iptables, NFQUEUE + bpf. Allow ICMP echo requests both ways. Plain ping between the two servers stops working while active.	
+tunnels/fake-tcp-header	Fake TCP header (bridges or TUN/GRE)	raw: Needs root, iptables, NFQUEUE + bpf. Captures ALL TCP from the peer public IP (SSH between the servers breaks). Allow the fake ports between both IPs.	
+tunnels/direct-tls	Direct TLS (official)		
+tunnels/direct-reality	Direct Reality (official)		
+tunnels/direct-quic	Direct QUIC (official)		
+tunnels/direct-kcp	Direct KCP (official)		
+tunnels/reverse-tls	Reverse TLS (official)		
+tunnels/reverse-reality	Reverse Reality (official)		
+tunnels/reverse-quic	Reverse QUIC (official)		
+tunnels/reverse-kcp	Reverse KCP (official)		
+proxies/local-proxies	Local SOCKS5 / HTTP proxy server	No authentication: keep the listener on 127.0.0.1 or firewall it, otherwise it is an open proxy.	
+proxies/protocol-proxies	VLESS / VMess / Trojan over TLS	UUID/password must match on client and server. Server needs a TLS certificate. The client side opens a SOCKS5 without a password: keep it on 127.0.0.1.	
+proxies/websocket	VMess over WebSocket + TLS	The client side opens a SOCKS5 without a password: keep it on 127.0.0.1.	
+proxies/socks-mux	SOCKS5 + Router + VLESS + Mux + TLS	The client side opens a SOCKS5 without a password: keep it on 127.0.0.1.	
+proxies/kcp	SOCKS5 -> VLESS + Mux + TLS over KCP	The client side opens a SOCKS5 without a password: keep it on 127.0.0.1.	
+proxies/quic	SOCKS5 -> VLESS + Mux over QUIC	The client side opens a SOCKS5 without a password: keep it on 127.0.0.1.	
+proxies/rtmp	SOCKS5 -> VLESS over RTMPS	The client side opens a SOCKS5 without a password: keep it on 127.0.0.1.	
+proxies/socks5-rtmp-reality	SOCKS5 over RTMP + Reality	Download goes over Reality, upload over RTMP split into parallel connections. Run WaterWall v1.6.0 or newer on BOTH sides. Use a normal HTTPS site for Reality (not Google or other big IP-whitelisted sites) and a real streaming host in rtmp_url. The client SOCKS5 has no password: keep it on 127.0.0.1.	v1.6.0
 __WWFAM__
 )
 WW_TEMPLATES=$(cat <<'__WWTPL__'
@@ -1205,7 +1241,7 @@ direct-rtmp.0	user_port	port	9000	Port users connect to
 direct-rtmp.0	server_ip	ip	"198.51.100.20"	Server public IPv4
 direct-rtmp.0	transport_port	port	443	Tunnel (transport) port
 direct-rtmp.0	tls_name	domain	"tunnel.example.com"	TLS domain (SNI / certificate)
-direct-rtmp.0	tc_url	str	"rtmps://tunnel.example.com:443/waterwall"	RTMP tc-url (rtmp[s]://host:port/app)
+direct-rtmp.0	tc_url	str	"rtmps://tunnel.example.com:443/waterwall"	RTMP tc-url shown in the handshake (rtmp[s]://host/waterwall)
 direct-rtmp.1	transport_port	port	443	Tunnel (transport) port
 direct-rtmp.1	certificate_path	path	"/etc/waterwall/fullchain.pem"	TLS certificate (fullchain) path
 direct-rtmp.1	key_path	path	"/etc/waterwall/privkey.pem"	TLS private key path
@@ -1213,7 +1249,7 @@ direct-rtmp.1	final_port	port	8080	Final service port (on the server)
 direct-rtmp.2	user_port	port	9000	Port users connect to
 direct-rtmp.2	server_ip	ip	"198.51.100.20"	Server public IPv4
 direct-rtmp.2	transport_port	port	1935	Tunnel (transport) port
-direct-rtmp.2	tc_url	str	"rtmp://198.51.100.20:1935/waterwall"	RTMP tc-url (rtmp[s]://host:port/app)
+direct-rtmp.2	tc_url	str	"rtmp://198.51.100.20:1935/waterwall"	RTMP tc-url shown in the handshake (rtmp[s]://host/waterwall)
 direct-rtmp.3	transport_port	port	1935	Tunnel (transport) port
 direct-rtmp.3	final_port	port	8080	Final service port (on the server)
 direct-tls.0	server_ip	ip	"198.51.100.20"	Server public IPv4
@@ -1515,7 +1551,7 @@ socks5-rtmp-reality.0	socks_address	ip	"127.0.0.1"	Local SOCKS5 listen address
 socks5-rtmp-reality.0	socks_port	port	1080	Local SOCKS5 port
 socks5-rtmp-reality.0	server_address	ip	"198.51.100.20"	Server address
 socks5-rtmp-reality.0	rtmp_port	port	1935	RTMP port
-socks5-rtmp-reality.0	rtmp_url	str	"rtmp://198.51.100.20:1935/waterwall"	RTMP tc-url
+socks5-rtmp-reality.0	rtmp_url	str	"rtmp://198.51.100.20:1935/waterwall"	RTMP tc-url shown in the handshake (a real streaming host, e.g. restream; keep /waterwall)
 socks5-rtmp-reality.0	reality_port	port	443	Reality port
 socks5-rtmp-reality.0	reality_sni	domain	"example.com"	Reality SNI (real website)
 socks5-rtmp-reality.0	reality_password	secret	"replace-with-reality-secret"	Reality password (same on both sides)
@@ -1581,12 +1617,17 @@ tpl_prompt_vars() {
     if [[ $prompt_def == "$d" ]] && is_demo_val "$d"; then
       case $type in secret) prompt_def=$(rand_pass 24);; uuid) prompt_def=$(new_uuid);; *) prompt_def="";; esac
     fi
-    if [[ $type == str && -n $prompt_def ]]; then  # follow earlier answers (e.g. IPs inside an RTMP URL)
+    if [[ $type == str && -n $prompt_def && $prompt_def != rtmp://live.restream.io/* ]]; then  # follow earlier answers (e.g. IPs inside an RTMP URL)
       for k in "${!REPL[@]}"; do prompt_def=${prompt_def//"$k"/"${REPL[$k]}"}; done
     fi
     [[ $type == cidr32 ]] && prompt_def=${prompt_def%/32}
-    if [[ $var == *reality* || $var == visitor_domain ]] && [[ $type == domain && $prompt_def == *example.com ]]; then
-      prompt_def=www.speedtest.net   # Reality must imitate a real, reachable TLS site
+    local reality_dom=0
+    if [[ $var == *reality* || $var == visitor_domain ]] && [[ $type == domain ]]; then
+      reality_dom=1; prompt_def=""     # Reality must imitate a normal, real HTTPS site of the user's choice
+      info "Reality cover site: a normal, real HTTPS site (not Google or other big IP-whitelisted sites). Same on both sides."
+    fi
+    if [[ ( $var == rtmp_url || $var == tc_url || $var == *.tc-url ) && $d == rtmp://* ]]; then
+      prompt_def="rtmp://live.restream.io/waterwall"   # look like a real streaming service; keep the /waterwall path
     fi
     case $var in
       certificate_path)
@@ -1597,11 +1638,13 @@ tpl_prompt_vars() {
         TVJ[certificate_path]=$(json_str "$CERT_FILE"); TVJ[key_path]=$(json_str "$KEY_FILE"); cert_done=1; continue;;
       key_path) ((cert_done)) && continue;;
       visitor_ip|ip_behind_domain_white)
-        local vh; ask vh "$label (domain or IP)" "${prompt_def:-www.speedtest.net}" is_host
+        info "Cover site: a normal, real HTTPS site (not Google or other big IP-whitelisted sites)."
+        local vh; ask vh "$label (domain or IP)" "" is_reality_host
         if ! is_ip "$vh"; then v=$(resolve4 "$vh"); [[ -n $v ]] || ask v "Could not resolve $vh; enter its IPv4" "" is_ipv4; else v=$vh; fi
         TVJ[$var]=$(json_str "$v"); TVRAW[$var]=$v; continue;;
     esac
-    ask v "$label" "$prompt_def" "$(tpl_validator "$type" "$var")"
+    local vfn; vfn=$(tpl_validator "$type" "$var"); (( reality_dom )) && vfn=is_reality_site
+    ask v "$label" "$prompt_def" "$vfn"
     TVRAW[$var]=$v
     case $type in
       port|int) TVJ[$var]=$((10#$v));;
@@ -1634,6 +1677,26 @@ tpl_render() { # tid -> stdout rendered compact json
   printf '%s' "$content"
 }
 
+# Unauthenticated SOCKS5/HTTP proxies must not listen publicly unless the user really wants that.
+# open_proxy_guard JSON -> prints the (possibly fixed) JSON
+open_proxy_guard() {
+  local json=$1 names
+  names=$(jq -r '. as $c | [.nodes[] | {(.name): .}] | add as $by
+    | $c.nodes[] | select(.type | test("Listener$")) | select(.next != null)
+    | select(((.settings.address // "0.0.0.0") | tostring | test("^(127\\.|::1$|localhost$)")) | not)
+    | . as $l | $by[$l.next] | select(.type == "Socks5Server" or .type == "HttpProxyServer")
+    | select(.settings["no-auth"] == true) | $l.name' <<<"$json" 2>/dev/null)
+  if [[ -n $names ]]; then
+    warn "Listener(s) $(tr '\n' ' ' <<<"$names")serve a SOCKS5/HTTP proxy WITHOUT a password on a public address." >&2
+    warn "Anyone on the internet could use it (open proxy)." >&2
+    if ! confirm "Keep it public anyway?" n; then
+      json=$(jq -c --arg n "$names" '($n | split("\n")) as $ns | (.nodes[] | select(.name as $x | $ns | index($x)) | .settings.address) = "127.0.0.1"' <<<"$json")
+      ok "Changed to 127.0.0.1 (local only)." >&2
+    fi
+  fi
+  printf '%s' "$json"
+}
+
 # Runs the official-template flow; fills NODES_JSON etc. for tunnel_finalize.
 gen_template() {
   need_jq
@@ -1655,8 +1718,11 @@ gen_template() {
     prereq_raw_check
     confirm "Continue with this raw-socket template?" y || return 1
   fi
+  local mincore; mincore=$(tpl_family_field "$fam" 4)
+  [[ -n $mincore ]] && { require_core_version "$mincore" || return 1; }
   tpl_prompt_vars "$tid" "$ROLE" || return 1
   local json; json=$(tpl_render "$tid") || return 1
+  json=$(open_proxy_guard "$json")
   # client-side certificate verification for TLS/QUIC clients
   if jq -e 'any(.nodes[]; .type=="TlsClient" or .type=="QuicClient")' >/dev/null <<<"$json"; then
     local vf=false; confirm "Is the server certificate self-signed (verify=false)?" y || vf=true
@@ -1691,6 +1757,12 @@ gen_import() {
     confirm "Import anyway?" n || { rm -f "$tmp"; return 1; }
   fi
   mkdir -p "$d/logs"; cp "$tmp" "$d/config.json"; rm -f "$tmp"
+  local q fixed; q=$(quote_placeholders "$d/config.json" | jq -c . 2>/dev/null)
+  if [[ -n $q ]]; then
+    fixed=$(open_proxy_guard "$q")
+    [[ $fixed != "$q" ]] && jq . <<<"$fixed" | sed -E 's/"__V_([A-Za-z0-9_]+)__"/$\1$/g' >"$d/config.json.new" \
+      && mv "$d/config.json.new" "$d/config.json"
+  fi
   ask CORE_MTU "core.json MTU (1400 for raw-socket/TUN tunnels, otherwise 1500)" "1500" is_num
   ROLE=custom; PREBUILT=1
 }
